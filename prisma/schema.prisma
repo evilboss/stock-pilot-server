@@ -9,18 +9,21 @@ datasource db {
 }
 
 model User {
-  id           String   @id @default(uuid())
-  email        String   @unique
-  password     String
-  firstName    String
-  lastName     String
-  isActive     Boolean  @default(true)
-  refreshToken String?
-  roleId       String
-  role         Role     @relation(fields: [roleId], references: [id])
-  createdAt    DateTime @default(now())
-  updatedAt    DateTime @updatedAt
-  auditLogs    AuditLog[]
+  id                      String                    @id @default(uuid())
+  email                   String                    @unique
+  password                String
+  firstName               String
+  lastName                String
+  isActive                Boolean                   @default(true)
+  refreshToken            String?
+  roleId                  String
+  role                    Role                      @relation(fields: [roleId], references: [id])
+  createdAt               DateTime                  @default(now())
+  updatedAt               DateTime                  @updatedAt
+  auditLogs               AuditLog[]
+  attendanceFlags         EmployeeAttendanceFlags?
+  attendanceRecords       AttendanceRecord[]
+  attendanceCorrections   AttendanceCorrectionLog[] @relation("CorrectionEditor")
 
   @@map("users")
 }
@@ -102,6 +105,7 @@ model Product {
   supplier        Supplier?       @relation(fields: [supplierId], references: [id])
   inventoryItems  InventoryItem[]
   transactions    StockTransaction[]
+  saleItems       SaleItem[]
   createdAt       DateTime        @default(now())
   updatedAt       DateTime        @updatedAt
 
@@ -116,10 +120,60 @@ model Warehouse {
   isActive       Boolean         @default(true)
   inventoryItems InventoryItem[]
   transactions   StockTransaction[]
+  sales          Sale[]
   createdAt      DateTime        @default(now())
   updatedAt      DateTime        @updatedAt
 
   @@map("warehouses")
+}
+
+model Sale {
+  id             String      @id @default(uuid())
+  invoiceNo      String      @unique
+  customerName   String?
+  customerPhone  String?
+  warehouseId    String
+  warehouse      Warehouse   @relation(fields: [warehouseId], references: [id])
+  items          SaleItem[]
+  subtotal       Decimal     @db.Decimal(10, 2)
+  discountAmount Decimal     @default(0) @db.Decimal(10, 2)
+  taxAmount      Decimal     @default(0) @db.Decimal(10, 2)
+  total          Decimal     @db.Decimal(10, 2)
+  paymentMethod  PaymentMethod @default(CASH)
+  status         SaleStatus  @default(COMPLETED)
+  notes          String?
+  soldById       String?
+  createdAt      DateTime    @default(now())
+  updatedAt      DateTime    @updatedAt
+
+  @@map("sales")
+}
+
+model SaleItem {
+  id        String  @id @default(uuid())
+  saleId    String
+  sale      Sale    @relation(fields: [saleId], references: [id], onDelete: Cascade)
+  productId String
+  product   Product @relation(fields: [productId], references: [id])
+  quantity  Int
+  unitPrice Decimal @db.Decimal(10, 2)
+  discount  Decimal @default(0) @db.Decimal(10, 2)
+  total     Decimal @db.Decimal(10, 2)
+
+  @@map("sale_items")
+}
+
+enum SaleStatus {
+  COMPLETED
+  REFUNDED
+  VOID
+}
+
+enum PaymentMethod {
+  CASH
+  CARD
+  GCASH
+  TRANSFER
 }
 
 model InventoryItem {
@@ -174,4 +228,118 @@ enum TransactionType {
   ADJUSTMENT
   TRANSFER
   RETURN
+}
+
+// ─── Attendance ───────────────────────────────────────────────────────────────
+
+model CompanyAttendanceSettings {
+  id                    String           @id @default(uuid())
+  enableManualAttendance Boolean         @default(true)
+  enableQrAttendance    Boolean          @default(false)
+  defaultMethod         AttendanceMethod @default(MANUAL)
+  enableLunchTracking   Boolean          @default(false)
+  requireLunchTracking  Boolean          @default(false)
+  actionCooldownSeconds Int              @default(60)
+  timezone              String           @default("UTC")
+  createdAt             DateTime         @default(now())
+  updatedAt             DateTime         @updatedAt
+
+  @@map("company_attendance_settings")
+}
+
+model EmployeeAttendanceFlags {
+  id                 String   @id @default(uuid())
+  userId             String   @unique
+  user               User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  allowManualOverride Boolean?
+  allowQrOverride    Boolean?
+  enableLunchOverride Boolean?
+  createdAt          DateTime @default(now())
+  updatedAt          DateTime @updatedAt
+
+  @@map("employee_attendance_flags")
+}
+
+model AttendanceRecord {
+  id             String                  @id @default(uuid())
+  userId         String
+  user           User                    @relation(fields: [userId], references: [id])
+  workDate       DateTime                @db.Date
+  status         AttendanceRecordStatus  @default(IN_PROGRESS)
+  totalWorkMins  Int?
+  totalBreakMins Int?
+  timezone       String                  @default("UTC")
+  events         AttendanceEvent[]
+  corrections    AttendanceCorrectionLog[]
+  createdAt      DateTime                @default(now())
+  updatedAt      DateTime                @updatedAt
+
+  @@unique([userId, workDate])
+  @@index([userId, workDate])
+  @@map("attendance_records")
+}
+
+model AttendanceEvent {
+  id             String              @id @default(uuid())
+  recordId       String
+  record         AttendanceRecord    @relation(fields: [recordId], references: [id], onDelete: Cascade)
+  eventType      AttendanceEventType
+  method         AttendanceMethod
+  occurredAt     DateTime
+  sourceIp       String?
+  sourceDevice   String?
+  qrTerminalId   String?
+  qrTerminal     QrTerminal?         @relation(fields: [qrTerminalId], references: [id])
+  isCorrection   Boolean             @default(false)
+  createdAt      DateTime            @default(now())
+
+  @@index([recordId, occurredAt])
+  @@map("attendance_events")
+}
+
+model QrTerminal {
+  id             String                @id @default(uuid())
+  name           String
+  code           String                @unique
+  location       String?
+  isActive       Boolean               @default(true)
+  expiresAt      DateTime?
+  allowedActions AttendanceEventType[]
+  events         AttendanceEvent[]
+  createdAt      DateTime              @default(now())
+  updatedAt      DateTime              @updatedAt
+
+  @@map("qr_terminals")
+}
+
+model AttendanceCorrectionLog {
+  id        String           @id @default(uuid())
+  recordId  String
+  record    AttendanceRecord @relation(fields: [recordId], references: [id])
+  editorId  String
+  editor    User             @relation("CorrectionEditor", fields: [editorId], references: [id])
+  reason    String
+  oldData   Json
+  newData   Json
+  createdAt DateTime         @default(now())
+
+  @@map("attendance_correction_logs")
+}
+
+enum AttendanceEventType {
+  CLOCK_IN
+  LUNCH_OUT
+  LUNCH_IN
+  CLOCK_OUT
+}
+
+enum AttendanceMethod {
+  MANUAL
+  QR
+}
+
+enum AttendanceRecordStatus {
+  IN_PROGRESS
+  COMPLETE
+  EXCEPTION
 }
