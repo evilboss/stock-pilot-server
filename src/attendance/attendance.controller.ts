@@ -2,19 +2,21 @@ import {
   Controller,
   Get,
   Post,
-  Patch,
   Body,
-  Param,
   Query,
   UseGuards,
   Req,
+  HttpCode,
+  HttpStatus,
 } from '@nestjs/common';
 import { ApiTags, ApiBearerAuth, ApiOperation } from '@nestjs/swagger';
 import { JwtAuthGuard } from '../common/guards/jwt-auth.guard';
+import { Public } from '../common/decorators/public.decorator';
 import { CurrentUser } from '../common/decorators/current-user.decorator';
 import { AttendanceService } from './attendance.service';
 import { AttendanceActionDto } from './dto/attendance-action.dto';
 import { QrScanDto } from './dto/qr-scan.dto';
+import { KioskScanDto } from './dto/kiosk-scan.dto';
 import { AttendanceFilterDto } from './dto/attendance-filter.dto';
 import { Request } from 'express';
 
@@ -40,6 +42,12 @@ export class AttendanceController {
     return this.service.getHistory(userId, filter);
   }
 
+  @Get('me/qr')
+  @ApiOperation({ summary: 'Generate opaque QR token for kiosk scanning (employee My QR)' })
+  getMyQr(@CurrentUser('sub') userId: string) {
+    return this.service.generateEmployeeQrToken(userId);
+  }
+
   @Post('me/action')
   @ApiOperation({ summary: 'Submit a manual attendance action (clock in/out, lunch)' })
   performAction(
@@ -47,20 +55,33 @@ export class AttendanceController {
     @Body() dto: AttendanceActionDto,
     @Req() req: Request,
   ) {
-    const ip = req.ip;
-    const device = req.headers['user-agent'];
-    return this.service.performManualAction(userId, dto, ip, device);
+    return this.service.performManualAction(userId, dto, req.ip, req.headers['user-agent'] as string);
   }
 
   @Post('me/qr-scan')
-  @ApiOperation({ summary: 'Submit attendance via QR code scan' })
+  @ApiOperation({ summary: 'Submit attendance via QR code scan (employee-initiated, explicit action)' })
   qrScan(
     @CurrentUser('sub') userId: string,
     @Body() dto: QrScanDto,
     @Req() req: Request,
   ) {
-    const ip = req.ip;
-    const device = req.headers['user-agent'];
-    return this.service.performQrScan(userId, dto, ip, device);
+    return this.service.performQrScan(userId, dto, req.ip, req.headers['user-agent'] as string);
+  }
+
+  // ── Kiosk (no auth — QR token is the credential) ─────────────────────────
+
+  @Public()
+  @Post('kiosk/scan')
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({
+    summary: 'Kiosk smart scan — auto-determines CLOCK_IN vs CLOCK_OUT from token',
+    description: 'No bearer auth. The qrToken (from GET /attendance/me/qr) is the credential.',
+  })
+  kioskScan(@Body() dto: KioskScanDto, @Req() req: Request) {
+    return this.service.performKioskScan(
+      dto,
+      req.ip,
+      req.headers['user-agent'] as string,
+    );
   }
 }
