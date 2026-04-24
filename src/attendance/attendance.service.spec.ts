@@ -1,5 +1,7 @@
 import { Test, TestingModule } from '@nestjs/testing';
 import { BadRequestException, ConflictException, ForbiddenException, NotFoundException } from '@nestjs/common';
+import { JwtService } from '@nestjs/jwt';
+import { ConfigService } from '@nestjs/config';
 import { AttendanceService } from './attendance.service';
 import { PrismaService } from '../prisma/prisma.service';
 import { AuditLogsService } from '../audit-logs/audit-logs.service';
@@ -56,6 +58,9 @@ describe('AttendanceService', () => {
 
   beforeEach(async () => {
     prisma = {
+      user: {
+        findUnique: jest.fn().mockResolvedValue(null),
+      },
       companyAttendanceSettings: {
         findFirst: jest.fn().mockResolvedValue(DEFAULT_SETTINGS),
         create: jest.fn().mockResolvedValue(DEFAULT_SETTINGS),
@@ -94,6 +99,17 @@ describe('AttendanceService', () => {
         AttendanceService,
         { provide: PrismaService, useValue: prisma },
         { provide: AuditLogsService, useValue: auditLogs },
+        {
+          provide: JwtService,
+          useValue: {
+            signAsync: jest.fn().mockResolvedValue('mock-qr-token'),
+            verifyAsync: jest.fn().mockResolvedValue({ sub: 'user-1', purpose: 'attendance-qr' }),
+          },
+        },
+        {
+          provide: ConfigService,
+          useValue: { get: jest.fn().mockReturnValue('test-secret') },
+        },
       ],
     }).compile();
 
@@ -281,6 +297,104 @@ describe('AttendanceService', () => {
           'admin',
         ),
       ).rejects.toThrow(NotFoundException);
+    });
+  });
+
+  // ── Kiosk smart scan ──────────────────────────────────────────────────────
+
+  describe('performKioskScan', () => {
+    const activeUser = { id: 'user-1', firstName: 'Jane', lastName: 'Doe', isActive: true };
+
+    beforeEach(() => {
+      prisma.user.findUnique = jest.fn().mockResolvedValue(activeUser);
+    });
+
+    it('clocks IN when no existing record', async () => {
+      prisma.attendanceRecord.findUnique.mockResolvedValue(null);
+      prisma.attendanceRecord.create.mockResolvedValue(makeRecord([]));
+      const newEvent = { id: 'ev-1', eventType: AttendanceEventType.CLOCK_IN, occurredAt: new Date(), method: 'QR' };
+      prisma.attendanceEvent.create.mockResolvedValue(newEvent);
+      prisma.attendanceRecord.update.mockResolvedValue(makeRecord([{ eventType: AttendanceEventType.CLOCK_IN }]));
+
+      const result = await service.performKioskScan({ qrToken: 'valid-token' });
+      expect(result.actionPerformed).toBe(AttendanceEventType.CLOCK_IN);
+      expect(result.employee.firstName).toBe('Jane');
+    });
+
+    it('clocks OUT when employee is clocked in', async () => {
+      prisma.attendanceRecord.findUnique.mockResolvedValue(
+        makeRecord([{ eventType: AttendanceEventType.CLOCK_IN }]),
+      );
+      const newEvent = { id: 'ev-2', eventType: AttendanceEventType.CLOCK_OUT, occurredAt: new Date(), method: 'QR' };
+      prisma.attendanceEvent.create.mockResolvedValue(newEvent);
+      prisma.attendanceRecord.update.mockResolvedValue(
+        makeRecord([{ eventType: AttendanceEventType.CLOCK_IN }, { eventType: AttendanceEventType.CLOCK_OUT }]),
+      );
+
+      const result = await service.performKioskScan({ qrToken: 'valid-token' });
+      expect(result.actionPerformed).toBe(AttendanceEventType.CLOCK_OUT);
+    });
+
+    it('returns LUNCH_IN when employee is on lunch', async () => {
+      prisma.attendanceRecord.findUnique.mockResolvedValue(
+        makeRecord([
+          { eventType: AttendanceEventType.CLOCK_IN },
+          { eventType: AttendanceEventType.LUNCH_OUT },
+        ]),
+      );
+      const newEvent = { id: 'ev-3', eventType: AttendanceEventType.LUNCH_IN, occurredAt: new Date(), method: 'QR' };
+      prisma.attendanceEvent.create.mockResolvedValue(newEvent);
+      prisma.attendanceRecord.update.mockResolvedValue(
+        makeRecord([
+          { eventType: AttendanceEventType.CLOCK_IN },
+          { eventType: AttendanceEventType.LUNCH_OUT },
+          { eventType: AttendanceEventType.LUNCH_IN },
+        ]),
+      );
+
+      const result = await service.performKioskScan({ qrToken: 'valid-token' });
+      expect(result.actionPerformed).toBe(AttendanceEventType.LUNCH_IN);
+    });
+
+    it('rejects invalid QR token', async () => {
+      const { UnauthorizedException } = await import('@nestjs/common');
+      // Override jwtService to throw
+      (service as any).jwtService.verifyAsync = jest.fn().mockRejectedValue(new Error('jwt expired'));
+
+      await expect(service.performKioskScan({ qrToken: 'bad-token' })).rejects.toThrow(
+        UnauthorizedException,
+      );
+    });
+
+    it('rejects inactive user', async () => {
+      prisma.user.findUnique = jest.fn().mockResolvedValue({ ...activeUser, isActive: false });
+
+      await expect(service.performKioskScan({ qrToken: 'valid-token' })).rejects.toThrow(
+        ForbiddenException,
+      );
+    });
+  });
+
+  // ── Employee QR token ─────────────────────────────────────────────────────
+
+  describe('generateEmployeeQrToken', () => {
+    it('returns token + expiry + employee info', async () => {
+      prisma.user.findUnique = jest.fn().mockResolvedValue({
+        id: 'user-1', firstName: 'Jane', lastName: 'Doe', isActive: true,
+      });
+
+      const result = await service.generateEmployeeQrToken('user-1');
+      expect(result.qrToken).toBe('mock-qr-token');
+      expect(result.employee.firstName).toBe('Jane');
+      expect(result.expiresAt).toBeInstanceOf(Date);
+    });
+
+    it('rejects inactive user', async () => {
+      prisma.user.findUnique = jest.fn().mockResolvedValue({
+        id: 'user-1', firstName: 'Jane', lastName: 'Doe', isActive: false,
+      });
+
+      await expect(service.generateEmployeeQrToken('user-1')).rejects.toThrow(ForbiddenException);
     });
   });
 });
