@@ -4,7 +4,10 @@ import {
   ForbiddenException,
   BadRequestException,
   ConflictException,
+  UnauthorizedException,
 } from '@nestjs/common';
+import { JwtService } from '@nestjs/jwt';
+import { ConfigService } from '@nestjs/config';
 import { PrismaService } from '../prisma/prisma.service';
 import { AuditLogsService } from '../audit-logs/audit-logs.service';
 import { AttendanceEventType } from './enums/attendance-event-type.enum';
@@ -15,10 +18,14 @@ import { AttendanceMethodResolver } from './resolvers/attendance-method-resolver
 import { AttendanceCalculator } from './calculators/attendance-calculator';
 import { AttendanceActionDto } from './dto/attendance-action.dto';
 import { QrScanDto } from './dto/qr-scan.dto';
+import { KioskScanDto } from './dto/kiosk-scan.dto';
 import { CorrectAttendanceDto } from './dto/correct-attendance.dto';
 import { AttendanceFilterDto } from './dto/attendance-filter.dto';
 import { UpdateAttendanceSettingsDto } from './dto/update-attendance-settings.dto';
 import { CreateQrTerminalDto } from './dto/create-qr-terminal.dto';
+
+const QR_TOKEN_PURPOSE = 'attendance-qr';
+const QR_TOKEN_TTL_HOURS = 8;
 
 const RECORD_INCLUDE = {
   events: { orderBy: { occurredAt: 'asc' as const } },
@@ -30,6 +37,8 @@ export class AttendanceService {
   constructor(
     private prisma: PrismaService,
     private auditLogs: AuditLogsService,
+    private jwtService: JwtService,
+    private configService: ConfigService,
   ) {}
 
   // ── Settings ──────────────────────────────────────────────────────────────
@@ -541,5 +550,115 @@ export class AttendanceService {
     });
 
     return updated;
+  }
+
+  // ── Employee QR token (My QR) ─────────────────────────────────────────────
+
+  async generateEmployeeQrToken(userId: string) {
+    const user = await this.prisma.user.findUnique({
+      where: { id: userId },
+      select: { id: true, firstName: true, lastName: true, isActive: true },
+    });
+    if (!user || !user.isActive) throw new ForbiddenException('User account is inactive.');
+
+    const secret = this.configService.get<string>('JWT_SECRET');
+    const expiresIn = `${QR_TOKEN_TTL_HOURS}h`;
+    const qrToken = await this.jwtService.signAsync(
+      { sub: userId, purpose: QR_TOKEN_PURPOSE },
+      { secret, expiresIn },
+    );
+    const expiresAt = new Date(Date.now() + QR_TOKEN_TTL_HOURS * 60 * 60 * 1000);
+
+    return {
+      qrToken,
+      expiresAt,
+      employee: { id: user.id, firstName: user.firstName, lastName: user.lastName },
+    };
+  }
+
+  // ── Kiosk smart scan ──────────────────────────────────────────────────────
+
+  async performKioskScan(dto: KioskScanDto, sourceIp?: string, sourceDevice?: string) {
+    // 1. Verify opaque QR token
+    const secret = this.configService.get<string>('JWT_SECRET');
+    let payload: { sub: string; purpose: string };
+    try {
+      payload = await this.jwtService.verifyAsync(dto.qrToken, { secret });
+    } catch {
+      throw new UnauthorizedException('Invalid or expired QR code. Please refresh your QR and try again.');
+    }
+    if (payload.purpose !== QR_TOKEN_PURPOSE) {
+      throw new UnauthorizedException('Invalid QR code type.');
+    }
+
+    const userId = payload.sub;
+
+    // 2. Resolve user
+    const user = await this.prisma.user.findUnique({
+      where: { id: userId },
+      select: { id: true, firstName: true, lastName: true, isActive: true },
+    });
+    if (!user || !user.isActive) {
+      throw new ForbiddenException('Employee account is inactive. Contact your administrator.');
+    }
+
+    // 3. Determine smart action from today's last event
+    const settings = await this.getSettings();
+    const today = this.todayInTz(settings.timezone);
+    const existingRecord = await this.prisma.attendanceRecord.findUnique({
+      where: { userId_workDate: { userId, workDate: today } },
+      include: { events: { orderBy: { occurredAt: 'asc' } } },
+    });
+
+    const lastEvent = existingRecord ? this.getLastEvent(existingRecord.events) : null;
+
+    let action: AttendanceEventType;
+    if (!lastEvent || lastEvent === AttendanceEventType.CLOCK_OUT) {
+      action = AttendanceEventType.CLOCK_IN;
+    } else if (
+      lastEvent === AttendanceEventType.CLOCK_IN ||
+      lastEvent === AttendanceEventType.LUNCH_IN
+    ) {
+      action = AttendanceEventType.CLOCK_OUT;
+    } else if (lastEvent === AttendanceEventType.LUNCH_OUT) {
+      // Scanning during lunch = returning from lunch
+      action = AttendanceEventType.LUNCH_IN;
+    } else {
+      throw new BadRequestException('Cannot determine next action from current attendance state.');
+    }
+
+    // 4. Cooldown check (prevents double-tap)
+    if (existingRecord) {
+      await this.assertCooldown(existingRecord as any, action);
+    }
+
+    // 5. Ensure record exists
+    const record = existingRecord ?? (await this.getOrCreateTodayRecord(userId, settings.timezone));
+
+    // 6. Commit event with kiosk metadata
+    const result = await this.commitEvent(record, action, AttendanceMethod.QR, {
+      sourceIp,
+      sourceDevice: sourceDevice ?? `kiosk:${dto.kioskId ?? 'unknown'}`,
+    });
+
+    await this.auditLogs.log({
+      action: `KIOSK_${action}`,
+      resource: 'attendance_event',
+      resourceId: result.event.id,
+      newValues: {
+        kioskId: dto.kioskId,
+        locationId: dto.locationId,
+        method: 'kiosk_qr_smart',
+        action,
+      },
+      userId,
+    });
+
+    return {
+      actionPerformed: action,
+      employee: { id: user.id, firstName: user.firstName, lastName: user.lastName },
+      timestamp: result.event.occurredAt,
+      record: result.record,
+    };
   }
 }
